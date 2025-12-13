@@ -2,14 +2,20 @@ import os
 import base64
 import requests
 import urllib3
-import re
+from operator import itemgetter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- CONFIGURATION (NA FORCED) ---
+# --- CONFIG ---
 REGION = "na"
 GLZ_URL = "https://glz-na-1.na.a.pvp.net"
 PD_URL  = "https://pd.na.a.pvp.net"
+
+# Colors
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+RESET = "\033[0m"
 
 RANK_NAMES = {
     0: "Unranked", 3: "Iron 1", 4: "Iron 2", 5: "Iron 3",
@@ -29,14 +35,8 @@ def get_headers(lockfile):
 
     try:
         entitlements = requests.get(f"{local_url}/entitlements/v1/token", headers=headers, verify=False).json()
-        
-        # Auto-detect Client Version
-        version = "release-10.00-shipping-12345" 
-        logs = os.path.join(os.getenv('LOCALAPPDATA'), r'VALORANT\Saved\Logs\ShooterGame.log')
-        if os.path.exists(logs):
-            with open(logs, 'r', errors='ignore') as f:
-                match = re.search(r'CI server version: (.+)', f.read())
-                if match: version = match.group(1).strip()
+        session = requests.get(f"{local_url}/chat/v1/session", headers=headers, verify=False).json()
+        version = session.get('client_version', "release-10.00-shipping-12345")
 
         return {
             'Authorization': f"Bearer {entitlements['accessToken']}",
@@ -46,19 +46,40 @@ def get_headers(lockfile):
         }
     except: return None
 
-def get_rank(puuid, headers):
+def get_rank_data(puuid, headers):
     try:
-        mmr = requests.get(f"{PD_URL}/mmr/v1/players/{puuid}", headers=headers, json=True)
-        if mmr.status_code == 200:
-            skills = mmr.json()['QueueSkills']['competitive']['SeasonalInfoBySeasonID']
-            latest_season = list(skills.keys())[-1]
-            tier = skills[latest_season]['CompetitiveTier']
-            return RANK_NAMES.get(tier, "Unknown")
+        url = f"{PD_URL}/mmr/v1/players/{puuid}/competitiveupdates?startIndex=0&endIndex=10&queue=competitive"
+        history = requests.get(url, headers=headers, json=True)
+        if history.status_code == 200:
+            matches = history.json().get('Matches', [])
+            for match in matches:
+                tier = match['TierAfterUpdate']
+                if tier > 0:
+                    return (tier, RANK_NAMES.get(tier, "Unranked"))
     except: pass
-    return "Unknown"
+    return (0, "Unranked")
+
+def print_team_table(team_name, players, color):
+    sorted_players = sorted(players, key=lambda x: x['rank_data'][0], reverse=True)
+    
+    print(f"\n{color}=== {team_name} ({len(players)}) ==={RESET}")
+    print(f"{'RANK':<12} | {'LVL':<4} | {'PLAYER ID'}")
+    print("-" * 40)
+    
+    for p in sorted_players:
+        rank_num, rank_name = p['rank_data']
+        level = p['level']
+        pid = p['Subject']
+        
+        warn = ""
+        # Smurf Logic: Level < 40 and Rank > Silver 3
+        if 0 < level < 40 and rank_num > 11:
+            warn = f"{YELLOW}⚠️{color}"
+
+        print(f"{color}{rank_name:<12} | {level:<4}{warn} | {pid[:8]}...{RESET}")
 
 def main():
-    print("--- 🕵️ ZERO TRACKER (LIVE) ---")
+    print("--- 🕵️ ZERO TRACKER (OPTIMIZED) ---")
     path = os.path.join(os.getenv('LOCALAPPDATA'), r'Riot Games\Riot Client\Config\lockfile')
     if not os.path.exists(path): print("❌ Start Valorant!"); return
     
@@ -68,46 +89,66 @@ def main():
     headers = get_headers(lockfile)
     if not headers: return
     
-    # Get My PUUID
     local_auth = base64.b64encode(f"riot:{lockfile['password']}".encode()).decode()
-    me = requests.get(f"https://127.0.0.1:{lockfile['port']}/chat/v1/session", headers={'Authorization': f'Basic {local_auth}'}, verify=False).json()['puuid']
-
-    print(f"✅ Connected to NA Server")
+    me_req = requests.get(f"https://127.0.0.1:{lockfile['port']}/chat/v1/session", headers={'Authorization': f'Basic {local_auth}'}, verify=False).json()
+    me = me_req['puuid']
     
-    # 1. CHECK PRE-GAME (Agent Select)
-    pregame = requests.get(f"{GLZ_URL}/pregame/v1/players/{me}", headers=headers, json=True)
-    if pregame.status_code == 200:
-        print("🎯 AGENT SELECT FOUND!")
-        match_id = pregame.json()['MatchID']
-        data = requests.get(f"{GLZ_URL}/pregame/v1/matches/{match_id}", headers=headers, json=True).json()
-        players = data['Teams'][0]['Players']
-        
-        print(f"\n{'RANK':<12} | {'PLAYER ID'}")
-        print("-" * 35)
-        for p in players:
-            print(f"{get_rank(p['Subject'], headers):<12} | {p['Subject'][:8]}...")
+    allies = []
+    enemies = []
+    my_team_id = None
 
-    # 2. CHECK CORE-GAME (Live Match)
-    else:
-        core = requests.get(f"{GLZ_URL}/core-game/v1/players/{me}", headers=headers, json=True)
-        if core.status_code == 200:
-            print("⚔️  LIVE MATCH FOUND!")
-            match_id = core.json()['MatchID']
-            data = requests.get(f"{GLZ_URL}/core-game/v1/matches/{match_id}", headers=headers, json=True).json()
-            players = data['Players'] # Note: Live game structure is slightly different
+    try:
+        # Pre-Game
+        pregame = requests.get(f"{GLZ_URL}/pregame/v1/players/{me}", headers=headers, json=True)
+        if pregame.status_code == 200:
+            print(f"{GREEN}🎯 AGENT SELECT FOUND!{RESET}")
+            match_id = pregame.json()['MatchID']
+            data = requests.get(f"{GLZ_URL}/pregame/v1/matches/{match_id}", headers=headers, json=True).json()
+            raw_players = data['Teams'][0]['Players']
             
-            print(f"\n{'RANK':<12} | {'PLAYER ID'}")
-            print("-" * 35)
-            for p in players:
-                print(f"{get_rank(p['Subject'], headers):<12} | {p['Subject'][:8]}...")
+            for p in raw_players:
+                # FIX: Read Level from Identity directly!
+                lvl = p.get('PlayerIdentity', {}).get('AccountLevel', 0)
+                
+                allies.append({
+                    'Subject': p['Subject'],
+                    'rank_data': get_rank_data(p['Subject'], headers),
+                    'level': lvl
+                })
+
+        # Live Game
         else:
-            print("💤 In Menu")
+            core = requests.get(f"{GLZ_URL}/core-game/v1/players/{me}", headers=headers, json=True)
+            if core.status_code == 200:
+                print(f"{RED}⚔️  LIVE MATCH FOUND!{RESET}")
+                match_id = core.json()['MatchID']
+                data = requests.get(f"{GLZ_URL}/core-game/v1/matches/{match_id}", headers=headers, json=True).json()
+                raw_players = data['Players']
+                
+                for p in raw_players:
+                    if p['Subject'] == me: my_team_id = p['TeamID']; break
+                
+                for p in raw_players:
+                    # FIX: Read Level from Identity directly!
+                    lvl = p.get('PlayerIdentity', {}).get('AccountLevel', 0)
+                    
+                    p_data = {
+                        'Subject': p['Subject'],
+                        'rank_data': get_rank_data(p['Subject'], headers),
+                        'level': lvl
+                    }
+                    
+                    if p['TeamID'] == my_team_id: allies.append(p_data)
+                    else: enemies.append(p_data)
+            else:
+                print("💤 In Menu")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+    if allies: print_team_table("MY TEAM", allies, GREEN)
+    if enemies: print_team_table("ENEMY TEAM", enemies, RED)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
-    
-    # This line forces the window to stay open
+    try: main()
+    except Exception as e: print(f"CRITICAL: {e}")
     input("\nPress Enter to close...")
