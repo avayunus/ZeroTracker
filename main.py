@@ -2,20 +2,17 @@ import os
 import base64
 import requests
 import urllib3
-from operator import itemgetter
+import urllib.parse
+import webbrowser  # New import for opening links
+import customtkinter as ctk
+import threading
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- CONFIG ---
-REGION = "na"
-GLZ_URL = "https://glz-na-1.na.a.pvp.net"
-PD_URL  = "https://pd.na.a.pvp.net"
-
-# Colors
-GREEN = "\033[92m"
-RED = "\033[91m"
-YELLOW = "\033[93m"
-RESET = "\033[0m"
+# --- CONFIG (LOCAL ONLY) ---
+REGION = "na" 
+GLZ_URL = f"https://glz-{REGION}-1.{REGION}.a.pvp.net"
+PD_URL  = f"https://pd.{REGION}.a.pvp.net"
 
 RANK_NAMES = {
     0: "Unranked", 3: "Iron 1", 4: "Iron 2", 5: "Iron 3",
@@ -32,12 +29,10 @@ def get_headers(lockfile):
     local_url = f"https://127.0.0.1:{lockfile['port']}"
     auth = base64.b64encode(f"riot:{lockfile['password']}".encode()).decode()
     headers = {'Authorization': f'Basic {auth}'}
-
     try:
         entitlements = requests.get(f"{local_url}/entitlements/v1/token", headers=headers, verify=False).json()
         session = requests.get(f"{local_url}/chat/v1/session", headers=headers, verify=False).json()
         version = session.get('client_version', "release-10.00-shipping-12345")
-
         return {
             'Authorization': f"Bearer {entitlements['accessToken']}",
             'X-Riot-Entitlements-JWT': entitlements['token'],
@@ -45,6 +40,17 @@ def get_headers(lockfile):
             'X-Riot-ClientPlatform': 'ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9'
         }
     except: return None
+
+def get_names(puuids, headers):
+    try:
+        url = f"{PD_URL}/name-service/v2/players"
+        response = requests.put(url, headers=headers, json=puuids, verify=False)
+        names = {}
+        if response.status_code == 200:
+            for player in response.json():
+                names[player['Subject']] = f"{player['GameName']}#{player['TagLine']}"
+        return names
+    except: return {}
 
 def get_rank_data(puuid, headers):
     try:
@@ -54,101 +60,172 @@ def get_rank_data(puuid, headers):
             matches = history.json().get('Matches', [])
             for match in matches:
                 tier = match['TierAfterUpdate']
-                if tier > 0:
-                    return (tier, RANK_NAMES.get(tier, "Unranked"))
+                if tier > 0: return (tier, RANK_NAMES.get(tier, "Unranked"))
     except: pass
     return (0, "Unranked")
 
-def print_team_table(team_name, players, color):
-    sorted_players = sorted(players, key=lambda x: x['rank_data'][0], reverse=True)
-    
-    print(f"\n{color}=== {team_name} ({len(players)}) ==={RESET}")
-    print(f"{'RANK':<12} | {'LVL':<4} | {'PLAYER ID'}")
-    print("-" * 40)
-    
-    for p in sorted_players:
-        rank_num, rank_name = p['rank_data']
-        level = p['level']
-        pid = p['Subject']
+# --- GUI CLASS ---
+class ZeroTrackerApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("ZeroTracker V12 - Tracker.gg Link") 
+        self.geometry("1000x600") 
+        self.minsize(900, 400)
+        self.attributes("-topmost", True)
+        ctk.set_appearance_mode("dark")
         
-        warn = ""
-        # Smurf Logic: Level < 40 and Rank > Silver 3
-        if 0 < level < 40 and rank_num > 11:
-            warn = f"{YELLOW}⚠️{color}"
+        # HeaderFrame
+        self.header_frame = ctk.CTkFrame(self)
+        self.header_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.label = ctk.CTkLabel(self.header_frame, text="READY TO SCAN", font=("Arial", 16, "bold"))
+        self.label.pack(side="left", padx=10)
 
-        print(f"{color}{rank_name:<12} | {level:<4}{warn} | {pid[:8]}...{RESET}")
+        self.btn = ctk.CTkButton(self.header_frame, text="SCAN LOBBY", command=self.refresh_data, 
+                                 fg_color="#FF4B50", width=120)
+        self.btn.pack(side="right", padx=10)
 
-def main():
-    print("--- 🕵️ ZERO TRACKER (OPTIMIZED) ---")
-    path = os.path.join(os.getenv('LOCALAPPDATA'), r'Riot Games\Riot Client\Config\lockfile')
-    if not os.path.exists(path): print("❌ Start Valorant!"); return
-    
-    with open(path, 'r') as f: data = f.read().split(':')
-    lockfile = {'port': data[2], 'password': data[3]}
-    
-    headers = get_headers(lockfile)
-    if not headers: return
-    
-    local_auth = base64.b64encode(f"riot:{lockfile['password']}".encode()).decode()
-    me_req = requests.get(f"https://127.0.0.1:{lockfile['port']}/chat/v1/session", headers={'Authorization': f'Basic {local_auth}'}, verify=False).json()
-    me = me_req['puuid']
-    
-    allies = []
-    enemies = []
-    my_team_id = None
+        # Main Container
+        self.main_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_container.pack(fill="both", expand=True, padx=10, pady=5)
 
-    try:
-        # Pre-Game
-        pregame = requests.get(f"{GLZ_URL}/pregame/v1/players/{me}", headers=headers, json=True)
-        if pregame.status_code == 200:
-            print(f"{GREEN}🎯 AGENT SELECT FOUND!{RESET}")
-            match_id = pregame.json()['MatchID']
-            data = requests.get(f"{GLZ_URL}/pregame/v1/matches/{match_id}", headers=headers, json=True).json()
-            raw_players = data['Teams'][0]['Players']
+        self.main_container.grid_columnconfigure(0, weight=1)
+        self.main_container.grid_columnconfigure(1, weight=1)
+        self.main_container.grid_rowconfigure(0, weight=1)
+
+        # Frames
+        self.my_team_frame = ctk.CTkScrollableFrame(self.main_container, label_text="MY TEAM (GREEN)")
+        self.my_team_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5)) 
+        
+        self.enemy_team_frame = ctk.CTkScrollableFrame(self.main_container, label_text="ENEMY TEAM (RED)")
+        self.enemy_team_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+    def refresh_data(self):
+        self.btn.configure(state="disabled", text="SCANNING...") 
+        threading.Thread(target=self.fetch_and_display).start()
+
+    def fetch_and_display(self):
+        # Clear UI
+        for widget in self.my_team_frame.winfo_children(): widget.destroy()
+        for widget in self.enemy_team_frame.winfo_children(): widget.destroy()
+
+        path = os.path.join(os.getenv('LOCALAPPDATA'), r'Riot Games\Riot Client\Config\lockfile')
+        if not os.path.exists(path):
+            self.label.configure(text="VALORANT NOT FOUND")
+            self.reset_btn()
+            return
+
+        try:
+            with open(path, 'r') as f: data = f.read().split(':')
+            lockfile = {'port': data[2], 'password': data[3]}
+            headers = get_headers(lockfile)
+            if not headers: 
+                self.reset_btn()
+                return
+
+            local_auth = base64.b64encode(f"riot:{lockfile['password']}".encode()).decode()
+            me_req = requests.get(f"https://127.0.0.1:{lockfile['port']}/chat/v1/session", headers={'Authorization': f'Basic {local_auth}'}, verify=False).json()
+            me = me_req['puuid']
+
+            players = []
+            is_pregame = False
             
-            for p in raw_players:
-                # FIX: Read Level from Identity directly!
-                lvl = p.get('PlayerIdentity', {}).get('AccountLevel', 0)
-                
-                allies.append({
-                    'Subject': p['Subject'],
-                    'rank_data': get_rank_data(p['Subject'], headers),
-                    'level': lvl
-                })
-
-        # Live Game
-        else:
-            core = requests.get(f"{GLZ_URL}/core-game/v1/players/{me}", headers=headers, json=True)
-            if core.status_code == 200:
-                print(f"{RED}⚔️  LIVE MATCH FOUND!{RESET}")
-                match_id = core.json()['MatchID']
-                data = requests.get(f"{GLZ_URL}/core-game/v1/matches/{match_id}", headers=headers, json=True).json()
-                raw_players = data['Players']
-                
-                for p in raw_players:
-                    if p['Subject'] == me: my_team_id = p['TeamID']; break
-                
-                for p in raw_players:
-                    # FIX: Read Level from Identity directly!
-                    lvl = p.get('PlayerIdentity', {}).get('AccountLevel', 0)
-                    
-                    p_data = {
-                        'Subject': p['Subject'],
-                        'rank_data': get_rank_data(p['Subject'], headers),
-                        'level': lvl
-                    }
-                    
-                    if p['TeamID'] == my_team_id: allies.append(p_data)
-                    else: enemies.append(p_data)
+            pregame = requests.get(f"{GLZ_URL}/pregame/v1/players/{me}", headers=headers, json=True)
+            if pregame.status_code == 200:
+                is_pregame = True
+                self.label.configure(text="AGENT SELECT")
+                match_id = pregame.json()['MatchID']
+                data = requests.get(f"{GLZ_URL}/pregame/v1/matches/{match_id}", headers=headers, json=True).json()
+                players = data['Teams'][0]['Players']
             else:
-                print("💤 In Menu")
-    except Exception as e:
-        print(f"❌ Error: {e}")
+                core = requests.get(f"{GLZ_URL}/core-game/v1/players/{me}", headers=headers, json=True)
+                if core.status_code == 200:
+                    self.label.configure(text="LIVE MATCH")
+                    match_id = core.json()['MatchID']
+                    data = requests.get(f"{GLZ_URL}/core-game/v1/matches/{match_id}", headers=headers, json=True).json()
+                    players = data['Players']
+                else:
+                    self.label.configure(text="IDLE (IN MENU)")
+                    self.reset_btn()
+                    return
 
-    if allies: print_team_table("MY TEAM", allies, GREEN)
-    if enemies: print_team_table("ENEMY TEAM", enemies, RED)
+            puuids = [p['Subject'] for p in players]
+            names_dict = get_names(puuids, headers)
+
+            my_team = []
+            enemy_team = []
+            my_team_id = "Blue"
+
+            if not is_pregame:
+                for p in players:
+                    if p['Subject'] == me: my_team_id = p['TeamID']
+
+            for p in players:
+                pid = p['Subject']
+                lvl = p.get('PlayerIdentity', {}).get('AccountLevel', 0)
+                rank_num, rank_name = get_rank_data(pid, headers)
+                full_name = names_dict.get(pid, "Unknown#0000")
+                
+                is_smurf = False
+                if 0 < lvl < 40 and rank_num > 11: is_smurf = True
+
+                p_obj = {
+                    "name": full_name, "rank_num": rank_num, 
+                    "rank_name": rank_name, "level": lvl, "smurf": is_smurf
+                }
+
+                if is_pregame: my_team.append(p_obj)
+                else:
+                    if p['TeamID'] == my_team_id: my_team.append(p_obj)
+                    else: enemy_team.append(p_obj)
+
+            my_team.sort(key=lambda x: x['rank_num'], reverse=True)
+            enemy_team.sort(key=lambda x: x['rank_num'], reverse=True)
+
+            self.render_table(self.my_team_frame, my_team, "#00FF7F")
+            self.render_table(self.enemy_team_frame, enemy_team, "#FF4B50")
+            
+        except Exception as e:
+            print(f"Loop Error: {e}")
+            self.label.configure(text="ERROR")
+
+        self.reset_btn()
+
+    def reset_btn(self):
+        self.btn.configure(state="normal", text="SCAN LOBBY")
+
+    def render_table(self, frame, team_data, color):
+        for p in team_data:
+            row = ctk.CTkFrame(frame, fg_color="#2B2B2B")
+            row.pack(fill="x", pady=2)
+
+            # Rank & Level
+            ctk.CTkLabel(row, text=p['rank_name'], width=70, text_color=color, font=("Consolas", 12, "bold")).pack(side="left", padx=5)
+            ctk.CTkLabel(row, text=f"Lvl {p['level']}", width=60, text_color="white", font=("Consolas", 12)).pack(side="left")
+
+            # BUTTON: Tracker.gg Link (Right Side)
+            # We create this first so it stays on the right
+            def open_tracker(name_tag=p['name']):
+                if "#" in name_tag:
+                    # Format: Name#TAG -> Name%23TAG
+                    safe_url = urllib.parse.quote(name_tag).replace('%23', '#') # Tracker uses # symbol sometimes but let's be safe
+                    # Actually tracker URL format is: https://tracker.gg/valorant/profile/riot/Name%23TAG/overview
+                    # We need to escape the # as %23
+                    safe_url = urllib.parse.quote(name_tag)
+                    url = f"https://tracker.gg/valorant/profile/riot/{safe_url}/overview"
+                    webbrowser.open(url)
+
+            # Tracker Button
+            ctk.CTkButton(row, text="TRN", width=40, height=20, command=open_tracker, 
+                          fg_color="#444", hover_color="#666").pack(side="right", padx=5)
+
+            # Smurf Tag
+            if p['smurf']:
+                ctk.CTkLabel(row, text="⚠️", text_color="yellow", font=("Arial", 14)).pack(side="right", padx=5)
+
+            # Name (Fills remaining space)
+            ctk.CTkLabel(row, text=p['name'], anchor="w", font=("Arial", 12)).pack(side="left", padx=5, fill="x", expand=True)
 
 if __name__ == "__main__":
-    try: main()
-    except Exception as e: print(f"CRITICAL: {e}")
-    input("\nPress Enter to close...")
+    app = ZeroTrackerApp()
+    app.mainloop()
