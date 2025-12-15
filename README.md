@@ -54,7 +54,3 @@ This project includes a `ZeroTracker.spec` file for use with PyInstaller. To bui
 ## Legal & Disclaimer
 
 ZeroTracker is not endorsed by Riot Games and does not reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games and all associated properties are trademarks or registered trademarks of Riot Games, Inc.
-
-## License
-
-[Insert License Name Here] - see the [LICENSE](LICENSE) file for details.
